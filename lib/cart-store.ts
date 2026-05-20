@@ -13,12 +13,14 @@ interface CartStore {
   items: CartItem[];
   restaurantId: string | null;
   restaurantSlug: string | null;
+  isDrawerOpen: boolean;
 
   // Actions
   addItem: (item: Omit<CartItem, 'quantity'>, restaurantId: string, restaurantSlug: string) => void;
   removeItem: (itemId: string) => void;
   updateQuantity: (itemId: string, quantity: number) => void;
   clearCart: () => void;
+  setDrawerOpen: (isOpen: boolean) => void;
 
   // Computed
   getSubtotal: () => number;
@@ -31,6 +33,7 @@ export const useCartStore = create<CartStore>()(
       items: [],
       restaurantId: null,
       restaurantSlug: null,
+      isDrawerOpen: false,
 
       addItem: (item, restaurantId, restaurantSlug) => {
         const state = get();
@@ -80,6 +83,8 @@ export const useCartStore = create<CartStore>()(
       },
 
       clearCart: () => set({ items: [], restaurantId: null, restaurantSlug: null }),
+
+      setDrawerOpen: (isOpen) => set({ isDrawerOpen: isOpen }),
 
       getSubtotal: () => {
         return get().items.reduce((acc, item) => acc + item.price * item.quantity, 0);
