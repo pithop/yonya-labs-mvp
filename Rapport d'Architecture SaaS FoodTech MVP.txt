@@ -1,0 +1,260 @@
+﻿Rapport d'Architecture Technique et Stratégie de Déploiement : SaaS B2B Yonya Labs
+1. Vision Architecturale et Fondations Cloud-Native
+La conception d'une plateforme SaaS B2B "Multi-Tenant" telle que Yonya Labs, opérant dans le secteur hautement transactionnel de la FoodTech, requiert une architecture intrinsèquement résiliente, hautement évolutive et strictement isolée. Le développement exclusif depuis un environnement cloud restreint, tel que GitHub Codespaces, impose l'adoption d'une approche intégralement Cloud-Native et d'un paradigme "Serverless". L'absence d'infrastructure locale ou de serveurs persistants dicte l'utilisation d'API managées et de fonctions exécutées à la demande (Edge Functions ou Serverless Functions) pour orchestrer la logique métier complexe, les flux de paiement sécurisés, et les communications asynchrones avec les terminaux matériels de type Internet des Objets (IoT) déployés dans les cuisines des restaurants.
+Le système projeté repose sur une trinité technologique soigneusement sélectionnée. En premier lieu, le framework Next.js, s'appuyant sur l'architecture App Router, est préconisé pour orchestrer le rendu hybride (Server-Side Rendering et Client-Side Rendering) de la Progressive Web App (PWA) destinée aux clients finaux, ainsi que le back-office de gestion réservé aux restaurateurs. En deuxième lieu, Supabase, agissant comme une surcouche managée de PostgreSQL, assure la persistance des données, la gestion des identités et la sécurité d'accès en temps réel. Enfin, un maillage d'interfaces de programmation (API) tierces de premier plan — incluant Stripe pour les opérations financières, Expedy et Sunmi pour l'impression thermique matérielle, et Stuart pour l'orchestration des flux logistiques — complète l'architecture. L'objectif fondamental de ce rapport exhaustif est de fournir une feuille de route technique, pragmatique et détaillée pour la mise en œuvre du Minimum Viable Product (MVP), en résolvant de manière définitive les défis liés à l'isolation des données multi-tenant, à l'encaissement décentralisé sans commission, à l'impression thermique à distance via le cloud, et à l'orchestration transparente des livraisons en marque blanche.
+2. Architecture Multi-Tenant et Isolation des Données (Supabase / PostgreSQL)
+La viabilité, la sécurité et la conformité réglementaire d'un SaaS B2B reposent avant tout sur l'étanchéité absolue de ses données. Un modèle Multi-Tenant implique par définition qu'une base de données unique héberge simultanément les informations critiques (menus, commandes, informations clients, flux financiers) de multiples entités clientes distinctes (les restaurateurs). Cette cohabitation nécessite une stratégie d'isolation robuste au niveau du moteur de base de données afin de prévenir toute fuite d'information transversale, qu'elle soit due à une vulnérabilité logicielle ou à une erreur de logique applicative.
+2.1 Stratégie de Partitionnement Logique
+L'architecture des bases de données multi-tenant se divise généralement en deux écoles : le partitionnement par schéma (Schema-per-Tenant), où chaque client dispose de son propre schéma PostgreSQL, et le partitionnement par ligne (Row-Level Isolation), où tous les clients partagent les mêmes tables, différenciés par une clé étrangère. Le tableau suivant analyse ces deux approches dans le contexte d'une startup FoodTech visant une mise à l'échelle massive.1
+Caractéristique Architecturale
+	Partitionnement par Schéma (Schema-per-Tenant)
+	Partitionnement par Ligne (Row-Level Isolation)
+	Isolation des données
+	Isolation physique très forte, risque de fuite quasi nul.
+	Isolation logique basée sur des politiques de sécurité strictes (RLS).
+	Évolutivité (Scalabilité)
+	Limitée. Gérer des milliers de schémas sature les pools de connexions PostgreSQL.
+	Excellente. Conçue pour gérer des millions de lignes réparties sur des milliers de tenants.
+	Complexité des Migrations
+	Extrêmement complexe. Les modifications de structure doivent s'appliquer sur chaque schéma individuellement.
+	Simple et standardisée. Une modification de table s'applique à tous les tenants simultanément.
+	Adéquation Serverless
+	Incompatible avec les architectures Serverless nécessitant une agilité de déploiement.
+	Idéale. S'intègre parfaitement avec les ORM modernes et les requêtes via API REST/GraphQL.
+	L'approche retenue pour Yonya Labs est indéniablement le partitionnement par ligne (Row-Level Isolation). La création d'un schéma dédié par restaurant complexifie inutilement les migrations de base de données, augmente les coûts d'infrastructure, et n'est techniquement pas adaptée à un modèle SaaS visant potentiellement des milliers de micro-tenants (les restaurants).1 Conséquemment, chaque table du schéma public, telles que menus, categories, menu_items, orders, et customers, doit impérativement inclure une colonne identifiante nommée restaurant_id (idéalement de type UUID), agissant comme clé étrangère référençant la table maîtresse restaurants.2 Pour garantir des temps de réponse optimaux, un index de type B-Tree doit systématiquement être appliqué sur cette colonne restaurant_id à travers toutes les tables. Cette indexation est cruciale pour optimiser les performances des requêtes de filtrage qui seront inévitablement imposées par le moteur de sécurité.1
+2.2 Row Level Security (RLS) et Optimisation par "Custom Claims"
+La sécurité au niveau des lignes, ou Row Level Security (RLS), intégrée nativement dans PostgreSQL, constitue le moteur central de l'isolation des données dans l'écosystème Supabase.4 RLS ajoute implicitement des clauses WHERE à chaque requête exécutée, garantissant que la base de données elle-même applique les règles d'accès, indépendamment du code de l'application cliente.5 Ainsi, même si une faille existe dans le code Next.js, les requêtes malveillantes seront rejetées par PostgreSQL.5
+Cependant, une implémentation naïve de la RLS peut s'avérer désastreuse pour les performances. Par exemple, l'utilisation de requêtes imbriquées ou de jointures directement au sein des politiques RLS (comme vérifier à chaque requête si l'utilisateur actuel appartient à l'équipe du restaurant via une table de liaison memberships) entraîne de graves dégradations de performances lors de requêtes à fort volume. Dans une telle configuration, le moteur PostgreSQL évalue la politique complexe pour chaque ligne individuelle retournée par la requête principale, multipliant exponentiellement le coût de calcul.1
+La solution architecturale optimale, recommandée pour les environnements de production à forte charge, consiste à utiliser les "Custom Claims" intégrés dans le JSON Web Token (JWT) de l'utilisateur authentifié.5 Le processus opérationnel est le suivant :
+1. Injection des métadonnées (Postgres Trigger et Auth Hook) : Lors de l'authentification initiale ou lors de l'assignation administrative d'un utilisateur à un restaurant spécifique, une fonction PostgreSQL dédiée (un Auth Hook) ou un Trigger intervient. Cette fonction met à jour le champ app_metadata de l'utilisateur, situé dans le schéma sécurisé auth.users.5 Il est fondamental de distinguer app_metadata (exclusivement modifiable par le serveur et les administrateurs) de user_metadata (modifiable par l'utilisateur final et donc non sécurisé pour les vérifications d'autorisation).5
+2. Structure du Claim Cryptographique : Lors de la génération de la session, le JWT émis par Supabase contiendra un objet app_metadata incluant explicitement le restaurant_id de l'utilisateur ainsi que son rôle hiérarchique (par exemple, owner, manager, ou staff). Les modifications de app_metadata ne pouvant être effectuées que côté serveur, l'intégrité de la sécurité est cryptographiquement garantie.5
+3. Politique RLS Performante : La politique RLS se contente de lire la variable de session contextuelle (le JWT décodé par Supabase) et d'extraire la valeur du claim en temps constant (O(1)), sans effectuer la moindre jointure ou sous-requête coûteuse.6
+L'implémentation SQL concrète d'une politique RLS optimisée pour la table orders, garantissant qu'un gérant ne voit que les commandes de son établissement, se formalise ainsi :
+
+
+
+
+
+
+SQL
+CREATE POLICY "Isolation stricte des commandes par restaurant" 
+ON public.orders 
+FOR ALL 
+TO authenticated 
+USING (
+ restaurant_id = (NULLIF(current_setting('request.jwt.claims', true)::jsonb -> 'app_metadata' ->> 'restaurant_id', ''))::uuid
+);
+
+Cette politique garantit, au niveau le plus bas du moteur de base de données, qu'une API compromise, une attaque par injection, ou une simple erreur d'implémentation dans le code Next.js ne pourra jamais exposer les commandes du Restaurant B au gérant du Restaurant A.5 L'accès public, destiné aux clients finaux accédant à la PWA pour consulter le menu, s'appuiera sur des politiques distinctes en lecture seule (FOR SELECT). Ces politiques publiques seront filtrées implicitement par le restaurant_id passé en paramètre dans l'URL de la PWA (par exemple, commande.yonyalabs.com/nom-du-resto), sans nécessiter d'authentification préalable.
+2.3 Gestion des Environnements et Déploiement des Migrations
+Dans un environnement de développement restreint aux codespaces éphémères, les modifications de la structure de la base de données (migrations SQL) doivent être rigoureusement versionnées et traçables. Le développement via GitHub Codespaces nécessite l'utilisation systématique de l'interface de ligne de commande (CLI) de Supabase pour générer des fichiers de migration locaux (via la commande supabase migration new) avant leur déploiement vers les environnements de staging ou de production.1 Il est absolument impératif, et ceci constitue une règle de sécurité cardinale, d'activer explicitement la Row Level Security sur toutes les nouvelles tables dès l'instant de leur création via la commande SQL : ALTER TABLE nom_de_la_table ENABLE ROW LEVEL SECURITY;.4 L'omission de cette simple commande rend les données de la table publiquement accessibles en lecture et en écriture à quiconque possède la clé API anonyme (anon key) du projet Supabase.4
+3. Ingénierie des Flux Financiers : Modèle Stripe Connect
+Le modèle économique (business model) de Yonya Labs présente une asymétrie singulière : un abonnement SaaS fixe (79€/mois) générant le revenu principal de la plateforme, couplé à une proposition de valeur agressive de 0% de commission sur le volume d'affaires généré par les restaurateurs. Cependant, l'intégration potentielle de frais logistiques dynamiques (les coûts de livraison) complexifie considérablement l'architecture des flux de paiement. Le système financier doit donc orchestrer deux flux distincts et étanches : la facturation logicielle B2B et l'encaissement transactionnel B2C.
+3.1 Évaluation Architecturale des Topologies Stripe Connect
+L'écosystème Stripe Connect propose plusieurs topologies de comptes (Standard, Express, Custom) associées à différents types de flux de facturation (Direct Charges, Destination Charges, Separate Charges and Transfers).9 Le choix de cette topologie détermine l'entité légale responsable des fonds, la gestion des litiges, et la charge de travail liée à la conformité réglementaire (KYC/AML). Le tableau comparatif ci-dessous détaille les implications de chaque type de compte et de charge.10
+Topologie de Facturation
+	Type de Compte Stripe Recommandé
+	Responsabilité des Litiges (Chargebacks) et Pertes
+	Expérience d'Intégration (Onboarding)
+	Faisabilité pour le modèle à 0% de commission
+	Destination Charges
+	Express ou Custom
+	La plateforme (Yonya Labs) assume l'entière responsabilité des soldes négatifs et de la fraude.
+	Personnalisée ou en marque blanche, gérée par la plateforme.
+	Impossible. Yonya Labs paierait les frais de carte bancaire sur le volume total, générant des pertes massives.
+	Direct Charges
+	Standard
+	Le compte connecté (le restaurateur) assume la responsabilité des litiges et de la fraude.
+	Hébergée par Stripe (Stripe-Hosted Onboarding), charge de conformité nulle pour la plateforme.
+	Idéale. Les frais Stripe sont directement déduits du compte du restaurateur. La plateforme ne subit aucun coût transactionnel.
+	Separate Charges & Transfers
+	Express ou Custom
+	La plateforme (Yonya Labs) assume la responsabilité. Utilisé pour les paiements fractionnés complexes.
+	Personnalisée, forte charge de conformité.
+	Inadaptée. Complexité superflue et mêmes problèmes de rentabilité que les Destination Charges.
+	L'analyse démontre que l'utilisation de Destination Charges avec des comptes Express ou Custom ferait de Yonya Labs le "Merchant of Record" (MoR). Dans ce scénario, la plateforme encaisse les fonds, assume la responsabilité légale des litiges (chargebacks), gère les remboursements, et surtout, paie les frais de traitement Stripe sur la totalité du montant transigé.9 Cela invalide mathématiquement le modèle à 0% de commission : Yonya Labs perdrait de l'argent sur chaque commande (environ 1.5% + 0.25€ par transaction) pour couvrir les frais de traitement des cartes bancaires.9
+La décision architecturale impérative pour Yonya Labs est l'utilisation de Stripe Connect Standard combiné aux Direct Charges. Dans cette configuration, le restaurateur crée son propre compte Stripe complet (ou connecte un compte existant) via un flux d'onboarding entièrement géré et hébergé par Stripe. Cette approche décharge totalement Yonya Labs du fardeau juridique de l'identification des clients (KYC) et de la lutte contre le blanchiment d'argent (AML).13
+3.2 Implémentation Pratique des Direct Charges (Modèle 0% Commission)
+Dans le paradigme des Direct Charges, le client final paie directement le restaurateur. Yonya Labs agit exclusivement comme une infrastructure logicielle invisible, facilitant la transaction sans jamais toucher les fonds du repas.9
+La séquence transactionnelle pour une commande typique de 30€ en "Click & Collect" se déroule ainsi :
+1. Le backend Next.js de Yonya Labs initie une session de paiement (Checkout Session ou PaymentIntent) via l'API Stripe. La particularité technique réside dans l'injection du paramètre Stripe-Account (contenant l'ID du compte connecté du restaurateur, par exemple acct_123456) dans l'en-tête (header) de la requête HTTP.9
+2. Le client final saisit ses coordonnées bancaires et valide le paiement de 30€.
+3. Stripe prélève automatiquement ses frais de traitement standard (par exemple, 1.5% + 0.25€) directement sur le solde brut du compte du restaurateur.9
+4. Le restaurateur encaisse le montant net. Yonya Labs n'intervient à aucun moment dans ce flux financier, n'apparaît pas sur le relevé bancaire du client, et n'assume aucun risque lié à la fraude ou à d'éventuels soldes négatifs.12
+3.3 Gestion Dynamique des Frais de Livraison (Logistique)
+Bien que la promesse commerciale soit de 0% de commission sur les ventes alimentaires, la logistique a un coût incompressible (par exemple, l'API de livraison Stuart facture environ 6€ par course selon la distance). Deux stratégies économiques sont envisageables : soit le restaurateur absorbe ce coût logistique (qui lui sera refacturé séparément par Yonya Labs), soit le client final s'acquitte des frais de livraison lors du passage en caisse.
+Si l'approche consistant à faire payer le client final est retenue, l'architecture financière s'adapte en exploitant le paramètre application_fee_amount lors de la création de la Direct Charge.9 Ce paramètre permet à la plateforme de prélever une somme fixe sur la transaction pour couvrir des services additionnels.
+Exemple détaillé du flux de fonds pour une commande de 30€ de repas avec 6€ de frais de livraison ajoutés au panier :
+* Le montant total facturé au client final s'élève à 36€.
+* Lors de la création de la session de paiement Checkout, le backend Yonya Labs définit la propriété application_fee_amount: 600 (valeur exprimée en centimes, correspondant à 6,00€).9
+* La transaction est traitée. Le compte du restaurateur est crédité, mais Stripe transfère instantanément et automatiquement les 6,00€ vers le compte de la plateforme Yonya Labs.9
+* Le restaurateur encaisse ses 30€ (déduction faite des frais de traitement Stripe calculés sur le total de 36€).
+* Yonya Labs dispose immédiatement des 6,00€ sur son propre solde Stripe, somme qui sera ultérieurement utilisée pour régler la facture de l'API Stuart.9
+* Note sur les remboursements : En cas d'annulation, la plateforme peut utiliser l'API de remboursement Stripe en spécifiant l'en-tête Stripe-Account. Il est crucial de passer le paramètre booléen refund_application_fee=true si la plateforme souhaite restituer les frais de livraison au restaurateur, évitant ainsi que ce dernier n'absorbe la perte logistique.9
+3.4 Encaissement de l'Abonnement SaaS (79€/mois) via Stripe Billing
+L'abonnement logiciel d'accès à la plateforme ne doit sous aucun prétexte être confondu, techniquement ou comptablement, avec les transactions de vente de nourriture des clients finaux. Pour automatiser l'encaissement des 79€ mensuels, Yonya Labs doit s'appuyer sur le sous-système Stripe Billing.16
+Lors de l'inscription initiale du restaurateur sur le back-office Yonya Labs, un objet Customer est instancié directement sur le compte Stripe principal de la plateforme (et non sur le compte connecté du restaurateur).16 La souscription récurrente (le plan tarifaire à 79€) est alors attachée à cet objet client. Les factures sont générées et prélevées mensuellement de manière autonome, offrant à Yonya Labs un flux de revenus SaaS prédictible (MRR), totalement découplé des fluctuations des volumes transactionnels de ses utilisateurs.
+4. Le Défi Technique Majeur : L'Impression IoT (Web-to-Print)
+Le cahier des charges de Yonya Labs impose une contrainte opérationnelle forte : l'impression automatique et instantanée des bons de préparation (tickets de caisse) directement dans les cuisines des restaurants via des imprimantes thermiques autonomes de type IoT (Internet of Things), mentionnant spécifiquement les écosystèmes Expedy ou Sunmi. Contrairement aux imprimantes USB traditionnelles qui requièrent la présence d'un ordinateur local ou d'une tablette Android exécutant un lourd service de mise en file d'attente (spooling), les imprimantes Cloud-Native récupèrent leurs tâches d'impression directement depuis un serveur distant via une connexion internet permanente (Ethernet, Wi-Fi ou carte SIM 4G/GPRS).18
+4.1 Architecture de l'Impression Cloud-Native
+La contrainte stricte d'un environnement de développement et d'exécution "Serverless" (Edge Functions, environnements éphémères) élimine d'emblée la possibilité de maintenir des connexions réseaux TCP/IP persistantes de bas niveau, ou de déployer un broker MQTT privé. Bien que le protocole MQTT soit un standard dans l'IoT pour sa faible latence, sa sécurisation, la gestion de ses certificats, et son maintien en condition opérationnelle exigent des ressources d'infrastructure dédiées en totale contradiction avec le paradigme serverless.
+La solution architecturale la plus pragmatique, évolutive et robuste pour la phase MVP consiste à s'appuyer sur l'API REST d'Expedy Cloud Print (API v2).20 L'infrastructure hébergée par Expedy agit ici comme un middleware asynchrone hautement disponible : le backend serverless de Yonya Labs pousse la tâche d'impression via une simple requête HTTP POST standard. Le cloud Expedy prend alors le relais, gère la file d'attente logicielle (spooling), résout les éventuels problèmes de latence réseau, et assure la livraison finale de la commande d'impression vers l'imprimante matérielle connectée.22
+4.2 Implémentation du Flux de Données (Du clic à l'impression matérielle)
+Le flux de données doit s'organiser de manière strictement asynchrone et séquentielle. Il est déclenché non pas par le clic du client sur le bouton "Payer", mais par la réception du Webhook de confirmation de paiement émis par Stripe (généralement l'événement checkout.session.async_payment_succeeded ou checkout.session.completed).9 Cela garantit qu'aucune commande non payée ou refusée par la banque ne soit imprimée en cuisine, évitant ainsi le gaspillage de denrées alimentaires.
+1. Réception du Webhook Stripe : Une route API (Route Handler) dans Next.js (ex: /api/webhooks/stripe) écoute, valide la signature cryptographique du Webhook Stripe, et confirme la transaction.
+2. Mise à jour de l'État : Le statut de la commande passe logiquement de PENDING (En attente) à PAID (Payée) dans la base de données Supabase.
+3. Génération du Ticket en Langage ESC/POS : Les imprimantes thermiques matérielles ne disposent pas de la mémoire ou des processeurs nécessaires pour interpréter des formats complexes tels que le HTML ou le PDF de manière native sans subir de lourdes pénalités de latence et de consommation de bande passante. Elles utilisent un langage machine de bas niveau appelé ESC/POS, constitué de commandes d'échappement binaires.22 L'API Expedy résout cette complexité en proposant une syntaxe abstraite et simplifiée, permettant d'utiliser des balises de formatage syntaxique directement au sein d'un payload JSON en texte clair.24
+Le tableau ci-dessous référence les balises de formatage essentielles supportées par le système d'impression en nuage d'Expedy et leur équivalence 24 :
+Balise Expedy
+	Description de l'Action sur l'Imprimante Thermique
+	Utilisation Recommandée dans le Ticket
+	<C>...</C>
+	Centre le texte sur la ligne courante.
+	En-têtes (Nom du restaurant), Pied de page (Remerciements).
+	<BOLD>...</BOLD>
+	Imprime le texte en caractères gras (chauffe accentuée).
+	Éléments critiques (Type de commande, Total financier).
+	<L>...</L>
+	Double la hauteur et la largeur des caractères.
+	Numéros de commande (visibilité maximale de loin en cuisine).
+	<BR>
+	Insère un saut de ligne physique (Line Break).
+	Espacement entre les blocs d'articles.
+	<CUT/>
+	Déclenche le massicot automatique de l'imprimante.
+	Obligatoire. À placer impérativement à la fin absolue du payload pour séparer les tickets physiques.
+	Exemple de construction du payload d'impression JSON :
+Le développeur, assisté par l'IA, devra concevoir une fonction utilitaire robuste chargée de transformer l'objet de données Order (contenant les arrays d'articles, les modificateurs de plats, et les sous-totaux) en une chaîne de caractères correctement formatée :
+
+
+
+
+
+
+JSON
+{
+ "printer_msg": "<C><BOLD>NOUVELLE COMMANDE</BOLD></C>\n<BR><C><L>#8920</L></C>\n<BR>Restaurant Yonya Labs\nType: CLICK & COLLECT\nClient: Jean Dupont\nTel: 06 12 34 56 78\n<BR>--------------------------------\n1x Burger Signature    14.00 EUR\n   - SANS Oignon\n   - Cuisson: Saignant\n1x Frites Truffées      4.50 EUR\n--------------------------------\nTOTAL:                 18.50 EUR\n<BR><C><BOLD>PAYE EN LIGNE</BOLD></C>\n<BR><BR><CUT/>",
+ "origin": "Yonya_Labs_NextJS_Backend"
+}
+
+4. Déclenchement de l'Appel API : La fonction fetch asynchrone de Node.js est invoquée en méthode POST vers l'endpoint sécurisé https://www.expedy.fr/api/v2/printers/{printer_uid}/print.20
+5. Authentification : L'en-tête de la requête doit inclure le jeton d'autorisation structuré ainsi : Authorization: {API_SID}:{API_TOKEN}, paramètres sensibles qui seront injectés dynamiquement via les variables d'environnement sécurisées du projet Next.js.23
+4.3 Robustesse, Tolérance aux Pannes et Alternatives (Sunmi)
+L'impression en cuisine est une fonction critique du cycle d'exploitation du restaurateur ; un ticket perdu équivaut à un repas non préparé et à un client insatisfait. L'architecture doit structurellement prévoir un système de gestion des erreurs et de tentatives de réexécution ("Retry"). Si l'API Expedy renvoie une erreur (par exemple, un code HTTP de la famille 4xx ou 5xx indiquant une surcharge ou une indisponibilité) 20, la tâche d'impression ne doit pas être abandonnée. Elle doit être sérialisée et insérée dans une table PostgreSQL dédiée (print_queue) dans Supabase avec un statut d'échec (FAILED). Un processus de type "Cron Job" (implémenté via l'extension pg_cron intégrée à Supabase ou via un service externe d'appel programmé comme Vercel Cron) balayera régulièrement cette table pour tenter de renvoyer les requêtes échouées jusqu'à validation.
+Le cahier des charges mentionne également l'usage potentiel de terminaux de marque Sunmi. Il est important de noter une divergence architecturale : les appareils Sunmi (tels que les modèles V2 ou V2 Pro) intègrent un système d'exploitation Android complet. Par défaut, ils ne fonctionnent pas comme des imprimantes passives en écoute sur le cloud, mais requièrent l'exécution d'une application Android spécifique (un fichier .apk) chargée d'interroger un serveur ou d'écouter des notifications Push.19 Si Yonya Labs opte pour ce matériel, il conviendra d'utiliser un SDK cloud propriétaire fourni par Sunmi, ou de s'appuyer sur des applications tierces pré-packagées (comme PrinterCo) qui exposent des API REST similaires à celles d'Expedy, permettant d'interagir avec l'imprimante matérielle via le cloud.19 Cette abstraction permet de conserver la pureté de l'architecture "Serverless" du backend Next.js sans nécessiter le développement interne d'applications Android complexes.
+5. Orchestration de la Logistique : Intégration de l'API Stuart en Marque Blanche
+L'intégration d'un service de livraison en marque blanche transforme Yonya Labs d'un simple système de numérisation de menus en une plateforme logistique complète de commerce unifié. L'intégration technique avec un prestataire de transport du dernier kilomètre tel que Stuart Delivery nécessite une gestion de l'état asynchrone extrêmement rigoureuse, dictée par les mouvements physiques des coursiers dans le monde réel.
+5.1 Authentification OAuth 2.0 (Flux Client Credentials)
+Contrairement à l'authentification par simple clé API, l'API de Stuart sécurise ses échanges via le protocole standard OAuth 2.0, en utilisant spécifiquement le flux d'octroi Client Credentials.29 Ce flux est sémantiquement conçu pour les communications de serveur à serveur (Server-to-Server), où aucune interaction avec un utilisateur humain n'est requise. Le backend Next.js doit requérir un jeton d'accès temporaire (Access Token) en interrogeant l'endpoint POST https://api.sandbox.stuart.com/oauth/token et en transmettant les identifiants client_id et client_secret fournis par Stuart.31
+Note d'Architecture Critique : Le jeton d'accès retourné possède une durée de validité prolongée de 30 jours.29 L'architecture doit impérativement prévoir un mécanisme de mise en cache de ce jeton (par exemple, dans une base de données de session en mémoire comme Redis, ou directement dans une table de configuration Supabase).32 Demander un nouveau jeton d'accès avant chaque création de commande entraînerait un épuisement rapide des quotas de limitation de débit (rate-limits) de l'API d'authentification de Stuart, provoquant des pannes d'orchestration.34 La logique backend doit simplement récupérer le jeton en cache, vérifier s'il est proche de son expiration, et le renouveler de manière asynchrone si nécessaire.
+5.2 Création de la Course (Flux de Job Creation)
+Dès lors qu'une commande cliente de type LIVRAISON est validée par le paiement, acceptée par le restaurateur, et en cours de préparation en cuisine, le backend Serverless initie la création d'une course (un "Job") vers les serveurs de Stuart en interrogeant l'endpoint REST POST /v2/jobs.29
+Le Payload JSON expédié lors de cette requête doit contenir des paramètres stricts et formatés avec précision :
+* pickups : L'adresse géographique exacte du restaurant d'origine, impérativement complétée par les coordonnées téléphoniques du gérant ou du responsable de salle (format E.164 exigé).35
+* dropoffs : L'adresse de destination fournie par le client final, accompagnée de son numéro de téléphone, et de toutes les instructions logistiques spéciales nécessaires (ex: "Bâtiment B, 3ème étage, Code porte: 1234A").29
+* client_reference : Cet attribut revêt une importance capitale. Il s'agit de l'UUID unique de la commande préalablement généré par la base de données Supabase. L'injection de cet identifiant métier garantit que toutes les mises à jour asynchrones (webhooks) ultérieurement émises par Stuart pourront être immédiatement liées de manière déterministe à la commande correspondante dans le système Yonya Labs, sans nécessiter de complexes tables de correspondance manuelles.35
+L'API de Stuart offre la flexibilité de planifier des commandes pour un traitement immédiat ("Instant", où le système recherche un coursier pour un enlèvement immédiat) ou programmées pour une fenêtre temporelle future ("Scheduled", utile pour les commandes passées à l'avance) via l'utilisation des champs pickup_at ou la définition d'intervalles de tolérance.35 Pour la phase initiale du MVP, la requête instantanée sera le chemin d'exécution privilégié. En retour d'un succès de création de Job, l'API Stuart délivre également des liens de suivi public (Tracking Links). Ces URLs peuvent être interceptées par le backend et expédiées de manière automatisée au client final via SMS (par exemple, en utilisant l'API Twilio), offrant une expérience de suivi en temps réel premium sans développement d'interface supplémentaire.36
+5.3 Sécurité Absolue des Webhooks Logistiques (Vérification HMAC-SHA256)
+L'évolution de l'état d'une livraison dans le monde réel (recherche d'un coursier, arrivée au point d'enlèvement, transport en cours, colis livré) s'opère de manière purement asynchrone.31 Pour éviter un couteux mécanisme de scrutation continue (polling) qui surchargerait inutilement les serveurs, Yonya Labs doit exposer une route d'API publique (un webhook listener, par exemple /api/webhooks/stuart) destinée à réceptionner de manière passive ces notifications de changement de statut émises par l'infrastructure de Stuart.36
+Le tableau ci-dessous établit la cartographie des événements Webhooks émis par Stuart et les statuts correspondants qui devront être reflétés dans la base de données Supabase 29 :
+Événement Webhook Stuart (Payload Status)
+	Signification de l'État Logistique
+	État Correspondant dans Supabase (orders.status)
+	searching
+	L'algorithme de dispatching recherche un coursier disponible.
+	DELIVERY_SEARCHING
+	in_progress
+	Un coursier a accepté la course et se dirige vers le restaurant.
+	COURIER_ON_THE_WAY
+	waiting_at_pickup
+	Le coursier est arrivé dans le périmètre géographique du restaurant (Geofencing 35m).
+	COURIER_WAITING
+	delivering
+	L'enlèvement est validé. Le coursier est en route vers le client final.
+	OUT_FOR_DELIVERY
+	finished
+	Le colis a été remis au client final. Preuve de livraison enregistrée.
+	COMPLETED
+	canceled / expired
+	La course a été annulée ou aucun coursier n'a pu être trouvé.
+	DELIVERY_FAILED
+	Alerte de Sécurité Architecturale Critique : C'est lors du traitement de ces webhooks que de multiples intégrations SaaS subissent des failles de sécurité majeures ou des dysfonctionnements chroniques.34 La route exposée par Yonya Labs étant physiquement ouverte sur internet, l'authenticité et l'intégrité de chaque requête entrante doivent être impérativement garanties par la vérification mathématique d'une signature cryptographique asymétrique, injectée par Stuart dans l'en-tête HTTP spécifique nommé X-Stuart-Signature.31
+Le calcul du hachage de vérification (utilisant l'algorithme HMAC-SHA256) requiert de manière stricte le corps brut de la requête HTTP entrante, c'est-à-dire la chaîne d'octets originelle, non altérée (le Raw HTTP Body). Dans le cadre du framework Next.js et de son App Router, l'extraction de ce corps brut ne doit surtout pas utiliser la méthode req.json(). Elle doit impérativement être effectuée via l'invocation de la méthode await req.text() (ou req.arrayBuffer()) avant toute tentative d'analyse ou de transformation JSON (JSON parsing) par l'application.38 Si le framework de développement, ou un middleware intermédiaire (comme body-parser), intercepte, analyse l'objet JSON, puis le resérialise sous forme de chaîne de caractères, l'ordonnancement interne des clés ou l'espacement des caractères d'échappement peut être infimement altéré. Cette simple modification, invisible à l'œil nu, modifiera irrévocablement l'empreinte binaire du message. Conséquemment, la comparaison de signature mathématique échouera systématiquement, poussant le backend de Yonya Labs à rejeter la requête pour cause d'invalidité perçue, et bloquant par extension toutes les mises à jour de statut en temps réel sur les tableaux de bord des restaurateurs.36
+Une fois la signature cryptographique formellement vérifiée et validée contre le secret partagé (Webhook Secret), le backend Serverless procède à la mise à jour sécurisée du statut dans la table orders de l'instance Supabase. À cet instant, grâce au protocole WebSocket géré par l'abonnement "Supabase Realtime" implémenté côté client, l'interface web (PWA) de la tablette du restaurateur se rafraîchira instantanément, signalant visuellement et de manière réactive que le coursier est en route, sans nécessiter le moindre rechargement manuel de la page web.40
+6. Plan de Séquençage Stratégique pour Assistant IA (Phase 1 : Le MVP)
+Le développement d'une architecture distribuée complexe, lorsqu'il est assisté par des outils d'intelligence artificielle générative spécialisés dans le code (tels que Cursor, GitHub Copilot, ou d'autres agents LLM), exige une méthodologie spécifique. L'IA générative excelle dans l'exécution de tâches ciblées, mais peine à maintenir une cohérence globale sur des projets étendus. Il est donc indispensable d'appliquer un découpage granulaire, séquentiel et atomique des tâches de développement. Plus le contexte d'un "prompt" (l'instruction textuelle fournie à l'IA) est circonscrit, technique et spécifique, moins le modèle linguistique risque d'halluciner des motifs d'architecture incompatibles ou obsolètes.
+Le plan de match ci-dessous formalise la séquence logique des prompts directifs à fournir étape par étape à l'assistant de code pour construire la Phase 1 (Le Minimum Viable Product de Yonya Labs). Ce séquençage garantit l'alignement des briques logicielles générées avec les choix architecturaux drastiques définis dans les chapitres précédents.
+Jalon 1 : Fondations d'Infrastructure et Sécurité Multi-Tenant
+Le socle de l'application doit être établi avant toute écriture de logique métier. Les erreurs commises à cette étape concernant l'isolation des données sont généralement irréversibles sans une réécriture majeure.
+* Tâche 1.1 : Initialisation de la Coquille du Projet.
+   * Prompt IA : "Initialise une nouvelle application Next.js (version 14 ou supérieure) en utilisant impérativement le paradigme App Router, configurée avec TypeScript, Tailwind CSS pour le stylage, et la bibliothèque de composants shadcn/ui. Installe la librairie officielle @supabase/ssr pour la gestion des sessions authentifiées. Configure les variables d'environnement locales (.env.local) pour pointer vers une instance Supabase. Crée un utilitaire de création de client Supabase standardisé (un fichier utils/supabase/server.ts pour le code côté serveur et utils/supabase/client.ts pour le navigateur) en suivant strictement les recommandations de la documentation officielle."
+* Tâche 1.2 : Modélisation Structurelle de la Base de Données.
+   * Prompt IA : "Rédige un script SQL de migration Supabase propre pour générer le schéma de la base de données. Crée les tables relationnelles suivantes : restaurants (id de type uuid primary key, name, slug text unique, stripe_account_id text), categories (id, restaurant_id foreign key, name, sort_order integer), menu_items (id, restaurant_id foreign key, category_id foreign key, name, description, price en integer centimes, is_available boolean), et orders (id, restaurant_id foreign key, total_amount integer, status text, stripe_payment_id text). Ajoute de manière explicite un index de type B-Tree sur la colonne restaurant_id de chaque table pour garantir des temps de lecture performants lors du filtrage RLS."
+* Tâche 1.3 : Implémentation du Moteur RLS et du Custom Claim Hook.
+   * Prompt IA : "Génère une migration SQL avancée qui crée une fonction PostgreSQL de type Auth Hook nommée custom_access_token_hook. Cette fonction PL/pgSQL doit intercepter le processus d'authentification et injecter de manière sécurisée le restaurant_id (récupéré depuis une table de liaison des utilisateurs) directement dans le JWT sous le nœud app_metadata. Ensuite, rédige les politiques de sécurité (Row Level Security - RLS) FOR ALL sur les tables menu_items et orders. Ces politiques doivent filtrer l'accès aux données en comparant la colonne restaurant_id avec la valeur extraite en temps réel via (auth.jwt()->'app_metadata'->>'restaurant_id')::uuid. Assure-toi d'inclure les commandes ALTER TABLE pour activer formellement la RLS sur l'ensemble des tables créées à l'étape précédente."
+Jalon 2 : Développement du Back-Office Sécurisé (Interface Restaurateur)
+L'interface de gestion (le tableau de bord) nécessite des composants réactifs et une intégration profonde avec le système d'authentification pour garantir que les gérants ne manipulent que leurs propres entités.
+* Tâche 2.1 : Flux d'Authentification et Gestion des Sessions.
+   * Prompt IA : "Crée une page de connexion Next.js sécurisée sur la route /login. L'authentification doit utiliser Supabase Auth (via Email et Mot de passe) combinée aux Server Actions de Next.js. Une fois la connexion validée, le système doit rediriger le gérant vers la route protégée /dashboard. Assure la persistance sécurisée de la session via la manipulation des cookies HTTP-Only en utilisant les utilitaires de la librairie @supabase/ssr."
+* Tâche 2.2 : Interface de Gestion du Catalogue (Menu CRUD).
+   * Prompt IA : "Développe une interface complexe de type React Client Component (avec la directive "use client") intégrée dans la route /dashboard/menu permettant la gestion complète du catalogue (CRUD) des menu_items. Inclus spécifiquement un interrupteur rapide (composant Switch ou Toggle) libellé 'Rupture de stock' permettant de modifier la propriété booléenne is_available d'un plat en un clic. L'interface doit souscrire aux événements de base de données via Supabase Realtime pour refléter les modifications opérées par d'autres employés du restaurant instantanément, en appliquant des mises à jour optimistes de l'UI (Optimistic UI updates) pour une sensation de fluidité immédiate."
+* Tâche 2.3 : Tableau de Bord des Commandes (Live Order Feed).
+   * Prompt IA : "Conçois et implémente une vue applicative de type 'Kanban' ou liste dynamique pour la gestion des commandes en direct sur la route /dashboard/orders. Le composant doit établir une connexion persistante via Supabase Realtime. Lorsqu'une nouvelle ligne est insérée dans la table orders avec un statut passant à PAID, la commande doit s'ajouter instantanément à la vue de l'utilisateur. Ajoute l'exécution d'un signal sonore d'alerte web en exploitant l'API HTML5 Audio (par exemple, un fichier ding.mp3 local) pour avertir physiquement la brigade de cuisine."
+Jalon 3 : Interface Client B2C (La PWA) et Tunnel d'Acquisition
+La vitrine publique doit être optimisée pour la rapidité d'affichage (SEO et performances sur réseau mobile) et proposer une expérience d'achat fluide (frictionless).
+* Tâche 3.1 : Rendu Dynamique et Isolation Visuelle par Tenant.
+   * Prompt IA : "Crée un composant Next.js Server-Side Rendering (SSR) dédié à la route dynamique /[restaurant_slug]. La logique doit extraire l'identifiant du restaurant basé sur ce slug d'URL en interrogeant la table restaurants. Génère l'affichage visuel de la carte du menu en requêtant les menu_items actifs, structurés et regroupés sémantiquement par la table categories. Étant donné que cette route est destinée à un public anonyme (les clients finaux non authentifiés), la requête Supabase doit s'appuyer sur des politiques RLS publiques en lecture seule (FOR SELECT), filtrées par l'ID du restaurant injecté."
+* Tâche 3.2 : Moteur d'État du Panier Éphémère.
+   * Prompt IA : "Implémente la logique d'un gestionnaire de panier d'achat asynchrone côté client en utilisant la librairie de gestion d'état Zustand. L'état du panier doit impérativement persister entre les rafraîchissements de page en utilisant le localStorage du navigateur. Le magasin (store) Zustand doit exposer des méthodes d'ajout, de retrait, et calculer dynamiquement le sous-total financier des articles. Pour l'interface utilisateur, intègre un composant de type tiroir latéral coulissant (Sheet ou Sidebar de shadcn/ui) permettant au client de visualiser et d'éditer le contenu de sa commande sans quitter la page de navigation du menu."
+Jalon 4 : Moteur Transactionnel Avancé (L'intégration Stripe Connect)
+C'est ici que l'architecture des flux financiers asymétriques prend forme. Les erreurs de code à ce stade entraînent des pertes financières et des responsabilités juridiques majeures.
+* Tâche 4.1 : Initiation Sécurisée du flux 'Direct Charge'.
+   * Prompt IA : "Implémente une route d'API sécurisée fonctionnant en méthode POST sur /api/checkout. Cette route doit réceptionner l'objet global du panier client ainsi que l'identifiant cryptographique restaurant_id. Construis de manière programmatique le tableau complexe line_items requis par le SDK Stripe. Instancie une nouvelle session de paiement via la fonction stripe.checkout.sessions.create configurée en mode payment. Règle architecturale stricte : la requête API vers Stripe doit impérativement inclure l'en-tête de délégation Stripe-Account: {stripe_account_id_du_restaurant} afin de forcer l'exécution du flux de paiement en mode 'Direct Charge'. Intègre l'UUID du restaurant_id et l'UUID de la commande générée dans le dictionnaire metadata de la session Stripe pour garantir la traçabilité lors du retour du paiement."
+* Tâche 4.2 : Le point de terminaison sécurisé du Webhook Stripe.
+   * Prompt IA : "Développe un Route Handler Next.js destiné à opérer sur /api/webhooks/stripe. Configuration vitale : désactive le parseur automatique de corps de requête (body parser) par défaut imposé par le framework. Utilise explicitement la fonction await req.text() pour extraire le buffer de données brutes intact de la requête HTTP. Procède à la validation cryptographique de l'événement entrant via la fonction stripe.webhooks.constructEvent, en utilisant le tampon brut extrait et la variable d'environnement secrète STRIPE_WEBHOOK_SECRET. Uniquement si l'événement intercepté correspond strictement à la chaîne checkout.session.completed, interroge la base de données Supabase pour faire évoluer le statut logique de la commande correspondante vers la constante PAID."
+Jalon 5 : Connectivité IoT en Cuisine (Impression Web-to-Print)
+L'actionnement de matériel physique depuis le cloud est sensible à la latence et à la connectivité.
+* Tâche 5.1 : Orchestration de l'API d'impression Cloud Expedy.
+   * Prompt IA : "Au sein du gestionnaire logique du Webhook Stripe précédemment créé, immédiatement après l'exécution de la mise à jour transactionnelle de la commande au statut PAID dans Supabase, implémente un appel asynchrone fetch en mode POST pointant vers l'API Cloud V2 d'Expedy (l'URL cible étant https://www.expedy.fr/api/v2/printers/{printer_uid}/print). Formate les détails commerciaux de la commande en une chaîne de caractères brute. Cette chaîne doit inclure les commandes de contrôle syntaxique propres au langage ESC/POS traduites pour l'API (utilise massivement les balises <C>, <BOLD>, <BR>, et garantit que la chaîne se termine invariablement par le tag <CUT/> pour ordonner la coupe du papier). Encapsule cette chaîne complexe dans le dictionnaire JSON sortant sous la clé printer_msg. Enveloppe l'intégralité de cet appel réseau dans un bloc de gestion d'erreur robuste (try/catch) afin d'assurer qu'un éventuel échec temporaire de l'infrastructure d'impression (timeout ou HTTP 500 de la part d'Expedy) ne vienne pas bloquer l'émission du code de retour HTTP 200 imposé par le Webhook de Stripe."
+L'exécution méthodique, étape par étape, de cette liste exhaustive de tâches séquentielles permettra au développeur logiciel et à son assistant d'intelligence artificielle de contourner élégamment les nombreux pièges inhérents à la conception d'architectures distribuées complexes. Cette approche garantit la mise sur le marché d'un Minimum Viable Product (MVP) reposant sur des fondations techniques saines, évolutives et hautement sécurisées. L'isolation stricte des bases de données couplée à la décentralisation absolue des flux de paiements transactionnels assure la résilience technologique de Yonya Labs, tout en maintenant sa stricte conformité juridique avec le modèle économique à 0% de commission revendiqué, ouvrant ainsi la voie à la Phase 2 et à l'intégration logistique à grande échelle de l'API Stuart.
+Works cited
+1. Best Practices for Supabase | Security, Scaling & Maintainability - Leanware, accessed May 19, 2026, https://www.leanware.co/insights/supabase-best-practices
+2. How to Structure a Multi-Tenant Backend in Supabase for a White-Label App? - Reddit, accessed May 19, 2026, https://www.reddit.com/r/Supabase/comments/1iyv3c6/how_to_structure_a_multitenant_backend_in/
+3. Troubleshooting | RLS Performance and Best Practices - Supabase Docs, accessed May 19, 2026, https://supabase.com/docs/guides/troubleshooting/rls-performance-and-best-practices-Z5Jjwv
+4. Row Level Security | Supabase Docs, accessed May 19, 2026, https://supabase.com/docs/guides/database/postgres/row-level-security
+5. Supabase RLS Best Practices: Production Patterns for Secure Multi ..., accessed May 19, 2026, https://makerkit.dev/blog/tutorials/supabase-rls-best-practices
+6. Query Performance with Row Level Security (RLS) : r/Supabase - Reddit, accessed May 19, 2026, https://www.reddit.com/r/Supabase/comments/1dv3kvq/query_performance_with_row_level_security_rls/
+7. Users | Supabase Docs, accessed May 19, 2026, https://supabase.com/docs/guides/auth/users
+8. Supabase RLS Guide: Policies That Actually Work - DesignRevision, accessed May 19, 2026, https://designrevision.com/blog/supabase-row-level-security
+9. Create direct charges - Stripe Documentation, accessed May 19, 2026, https://docs.stripe.com/connect/direct-charges
+10. Understand how charges work in a Connect integration - Stripe Documentation, accessed May 19, 2026, https://docs.stripe.com/connect/charges
+11. Connect account types | Stripe Documentation, accessed May 19, 2026, https://docs.stripe.com/connect/accounts
+12. Pricing information | Stripe Connect, accessed May 19, 2026, https://stripe.com/connect/pricing
+13. Choose the right Stripe Connect charge type for your marketplace business model, accessed May 19, 2026, https://www.cobbleweb.co.uk/choose-the-right-stripe-connect-charge-type-for-your-marketplace-business-model/
+14. Stripe Connect | Platform and Marketplace Payment Solutions, accessed May 19, 2026, https://stripe.com/connect
+15. Collect application fees | Stripe Documentation, accessed May 19, 2026, https://docs.stripe.com/connect/marketplace/tasks/app-fees
+16. Create subscriptions with Stripe Billing - Stripe Documentation, accessed May 19, 2026, https://docs.stripe.com/connect/subscriptions
+17. Stripe Billing | Recurring Payments & Subscription Solutions, accessed May 19, 2026, https://stripe.com/billing
+18. Overview | Expedy - HubRise, accessed May 19, 2026, https://www.hubrise.com/apps/expedy
+19. PrinterCo - Apps on Google Play, accessed May 19, 2026, https://play.google.com/store/apps/details?id=com.printerco.app
+20. Create a Print Job | Expedy API v2, accessed May 19, 2026, https://expedy.stoplight.io/docs/api-v2/01132c3490c8b-create-a-print-job
+21. Create a Print Job - Expedy Docs, accessed May 19, 2026, https://docs.expedy.io/en/expedy-print/api-print-v2/create-a-print-job
+22. Connecting an ESC POS receipt printer to the Cloud Print Box adapter - Expedy Docs, accessed May 19, 2026, https://docs.expedy.io/en/usb-cloud-printer-adapter/rpi-installation/connecting-an-esc-pos-receipt-printer-to-the-cloud-print-box-adapter
+23. Cloud Print Server for Developers - Expedy Print, accessed May 19, 2026, https://www.expedy.io/en
+24. Text Layout - Expedy Docs, accessed May 19, 2026, https://docs.expedy.io/en/expedy-print/receipt-layout/text-layout-tags
+25. Imprimer un PDF depuis son ordinateur vers une imprimante à distance - Expedy Docs, accessed May 19, 2026, https://docs.expedy.io/fr/usb-cloud-printer-adapter/tutorials/print-a-pdf-from-your-computer-to-a-cloud-printer
+26. Error handling - Expedia Group Developer Hub, accessed May 19, 2026, https://developers.expediagroup.com/supply/lodging/docs/booking_apis/reservations/lsgql_reference/error_handling/
+27. hendrysetiadi/react-native-sunmi-printer - GitHub, accessed May 19, 2026, https://github.com/hendrysetiadi/react-native-sunmi-printer
+28. FrenkyDema/sunmi_cloud_printer: Package for use sunmi cloud printer - GitHub, accessed May 19, 2026, https://github.com/FrenkyDema/sunmi_cloud_printer
+29. Stuart API | Documentation | Postman API Network, accessed May 19, 2026, https://www.postman.com/stuart-1/stuart-api/documentation/qpkres0/stuart-api
+30. Understanding OAuth 2.0 Client Credentials Grant (Part 2) | by Florian Röser - Medium, accessed May 19, 2026, https://medium.com/@vgzxkgmrpn/understanding-oauth-2-0-client-credentials-grant-5b147354a5aa
+31. Stuart API, accessed May 19, 2026, https://api-docs.stuart.com/
+32. API Authentication Best Practices | Stuart Developers, accessed May 19, 2026, https://stuart.com/developers/best-practices/authentication/
+33. StuartApp/stuart-client-php - GitHub, accessed May 19, 2026, https://github.com/StuartApp/stuart-client-php
+34. API red flags your procurement team missed (and why you're stuck with terrible vendor integrations) - DEV Community, accessed May 19, 2026, https://dev.to/stuart_watkins_555e9d30ee/api-red-flags-your-procurement-team-missed-and-why-youre-stuck-with-terrible-vendor-integrations-2an9
+35. Setup for Success - Developers - Stuart, accessed May 19, 2026, https://stuart.com/developers/setup-for-success/
+36. Order Tracking API: Best Practices for Developers - Stuart, accessed May 19, 2026, https://stuart.com/developers/best-practices/order-tracking/
+37. Scheduled Deliveries: API Best Practices - Stuart, accessed May 19, 2026, https://stuart.com/developers/best-practices/scheduled-offering/
+38. Intercepting Raw HTTP Request Bodies: Ensuring Security and Authenticity in Webhooks and API Integrations - Rohit Kumar, accessed May 19, 2026, https://stenzr.medium.com/intercepting-raw-http-request-bodies-ensuring-security-and-authenticity-in-webhooks-and-api-3b365b8a795b
+39. How to Build Webhook Handlers with Signature Verification in Rust - OneUptime, accessed May 19, 2026, https://oneuptime.com/blog/post/2026-01-25-webhook-handlers-signature-verification-rust/view
+40. Supabase for B2B SaaS, accessed May 19, 2026, https://supabase.com/solutions/b2b-saas
