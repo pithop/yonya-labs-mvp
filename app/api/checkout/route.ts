@@ -28,13 +28,6 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Restaurant introuvable.' }, { status: 404 });
     }
 
-    if (!restaurant.stripe_account_id) {
-      return NextResponse.json(
-        { error: 'Ce restaurant n\'a pas encore configuré ses paiements en ligne.' },
-        { status: 400 }
-      );
-    }
-
     // 3. Calcul des montants
     let foodSubtotal = 0;
     const lineItems = cartItems.map((item: any) => {
@@ -109,10 +102,9 @@ export async function POST(request: Request) {
       // On continue mais on log l'erreur pour ne pas bloquer le paiement
     }
 
-    // 5. Créer la session de paiement Stripe Checkout (Direct Charge)
+    // 5. Créer la session de paiement Stripe Checkout
     const origin = request.headers.get('origin') || 'http://localhost:3000';
     
-    // Direct Charge Stripe Connect Standard
     const sessionPayload: any = {
       mode: 'payment',
       line_items: lineItems,
@@ -130,15 +122,18 @@ export async function POST(request: Request) {
       },
     };
 
-    // Si livraison, prélever le montant logistique Stuart en tant que frais d'application
-    // Cette somme est reversée de Stripe Connect vers le solde Stripe de Yonya Labs
-    if (deliveryFee > 0) {
-      sessionPayload.payment_intent_data.application_fee_amount = deliveryFee;
+    // Si on utilise Stripe Connect (Mode B2B 0% Commission réel)
+    if (restaurant.stripe_account_id) {
+      if (deliveryFee > 0) {
+        sessionPayload.payment_intent_data.application_fee_amount = deliveryFee;
+      }
     }
 
-    const session = await stripe.checkout.sessions.create(sessionPayload, {
-      stripeAccount: restaurant.stripe_account_id, // FORCAGE EN DIRECT CHARGE
-    });
+    // Création de la session (avec ou sans Connect selon que le restaurant est configuré)
+    const session = await stripe.checkout.sessions.create(
+      sessionPayload,
+      restaurant.stripe_account_id ? { stripeAccount: restaurant.stripe_account_id } : undefined
+    );
 
     // Mettre à jour l'ID du PaymentIntent ou Session Stripe dans la commande
     await supabase
