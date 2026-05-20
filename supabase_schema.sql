@@ -111,19 +111,19 @@ DECLARE
 BEGIN
     -- CAS D'INSERTION OU DE MISE A JOUR : Synchroniser le JWT
     IF TG_OP = 'INSERT' OR TG_OP = 'UPDATE' THEN
-        SELECT app_metadata INTO _app_metadata FROM auth.users WHERE id = NEW.user_id;
+        SELECT raw_app_meta_data INTO _app_metadata FROM auth.users WHERE id = NEW.user_id;
         _app_metadata := coalesce(_app_metadata, '{}'::jsonb) || jsonb_build_object(
             'restaurant_id', NEW.restaurant_id,
             'role', NEW.role
         );
-        UPDATE auth.users SET app_metadata = _app_metadata WHERE id = NEW.user_id;
+        UPDATE auth.users SET raw_app_meta_data = _app_metadata WHERE id = NEW.user_id;
         RETURN NEW;
     -- CAS DE SUPPRESSION : Nettoyer les Custom Claims du JWT
     ELSIF TG_OP = 'DELETE' THEN
-        SELECT app_metadata INTO _app_metadata FROM auth.users WHERE id = OLD.user_id;
+        SELECT raw_app_meta_data INTO _app_metadata FROM auth.users WHERE id = OLD.user_id;
         IF _app_metadata IS NOT NULL THEN
             _app_metadata := _app_metadata - 'restaurant_id' - 'role';
-            UPDATE auth.users SET app_metadata = _app_metadata WHERE id = OLD.user_id;
+            UPDATE auth.users SET raw_app_meta_data = _app_metadata WHERE id = OLD.user_id;
         END IF;
         RETURN OLD;
     END IF;
