@@ -35,8 +35,8 @@ interface Props {
 export default function MenuClient({ restaurant, categories, menuItems }: Props) {
   const addItem = useCartStore((s) => s.addItem);
   const cartItems = useCartStore((s) => s.items);
-  const cartTotal = useCartStore((s) => s.getTotal());
-  const toggleDrawer = useCartStore((s) => s.toggleDrawer);
+  const cartTotal = useCartStore((s) => s.getSubtotal());
+  const setDrawerOpen = useCartStore((s) => s.setDrawerOpen);
   
   const [activeCategory, setActiveCategory] = useState<string | null>(
     categories.length > 0 ? categories[0].id : null
@@ -210,7 +210,7 @@ export default function MenuClient({ restaurant, categories, menuItems }: Props)
       {cartItems.length > 0 && (
         <div className="fixed bottom-6 left-1/2 -translate-x-1/2 w-full max-w-md px-4 z-50 animate-fade-in-up">
           <button
-            onClick={toggleDrawer}
+            onClick={() => setDrawerOpen(true)}
             className="w-full flex items-center justify-between bg-gradient-to-r from-orange-500 to-amber-500 text-white p-4 rounded-2xl font-bold shadow-[0_10px_40px_rgba(249,115,22,0.4)] transition-transform duration-300 hover:scale-[1.02] active:scale-[0.98]"
           >
             <div className="flex items-center justify-center bg-white/20 rounded-xl h-10 w-10 text-sm">
